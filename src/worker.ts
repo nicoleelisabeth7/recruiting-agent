@@ -3,59 +3,84 @@
  *
  * Flow:
  * 1. User @mentions bot in Slack with JD + resume PDFs
- * 2. Worker receives app_mention + file_shared events
+ * 2. Worker receives app_mention event
  * 3. Downloads files from Slack (requires Bot Token)
  * 4. Extracts text from PDFs
- * 5. Loads JD, finds scoring rubric, scores candidates
+ * 5. Scores candidates against appropriate rubric
  * 6. Posts Tier 1 candidates back to Slack thread
  */
 
 import { Router } from 'itty-router';
-import { verifySlackRequest, downloadSlackFile, parseMultipartForm } from './lib/slack';
+import { verifySlackRequest, downloadSlackFile, postSlackMessage } from './lib/slack';
+import { extractTextFromFile } from './lib/pdf';
+import { scoreCandidate, parsePMMRubric } from './lib/scoring';
+import { formatAndPostResults } from './lib/results';
 
 interface Env {
   SLACK_BOT_TOKEN: string;
   SLACK_SIGNING_SECRET: string;
 }
 
+interface SlackFile {
+  id: string;
+  name: string;
+  title: string;
+  mimetype: string;
+  url_private: string;
+  url_private_download: string;
+}
+
+interface AppMentionEvent {
+  type: 'app_mention';
+  user: string;
+  channel: string;
+  text: string;
+  ts: string;
+  thread_ts?: string;
+  files?: SlackFile[];
+}
+
+interface SlackEvent {
+  type: 'url_verification' | 'event_callback';
+  challenge?: string;
+  event?: AppMentionEvent;
+}
+
 const router = Router();
 
 // POST /slack/events - Slack event subscription
 router.post('/slack/events', async (req: Request, env: Env) => {
-  const signature = req.headers.get('X-Slack-Request-Timestamp') || '';
-  const requestSignature = req.headers.get('X-Slack-Signature') || '';
+  try {
+    const signature = req.headers.get('X-Slack-Request-Timestamp') || '';
+    const requestSignature = req.headers.get('X-Slack-Signature') || '';
+    const body = await req.text();
 
-  // Verify Slack request authenticity
-  if (!verifySlackRequest(env.SLACK_SIGNING_SECRET, signature, requestSignature, req.body)) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-
-  const body = await req.json() as SlackEvent;
-
-  // Slack URL verification challenge (on first setup)
-  if (body.type === 'url_verification') {
-    return new Response(body.challenge);
-  }
-
-  // Handle events
-  if (body.type === 'event_callback') {
-    const event = body.event as SlackEventPayload;
-
-    // @mention bot in channel with files
-    if (event.type === 'app_mention') {
-      await handleAppMention(event, env);
-      return new Response('OK');
+    // Verify Slack request authenticity
+    if (!verifySlackRequest(env.SLACK_SIGNING_SECRET, signature, requestSignature, body)) {
+      return new Response('Unauthorized', { status: 401 });
     }
 
-    // File uploaded to channel/thread (optional - can parse from message attachments too)
-    if (event.type === 'file_shared') {
-      // File info is in event.file_id; would need to call files.info to get download URL
-      // For simplicity, handle files via message attachments in app_mention
-      return new Response('OK');
-    }
-  }
+    const bodyJson = JSON.parse(body) as SlackEvent;
 
-  return new Response('OK');
+    // Slack URL verification challenge (on first setup)
+    if (bodyJson.type === 'url_verification') {
+      return new Response(bodyJson.challenge);
+    }
+
+    // Handle events
+    if (bodyJson.type === 'event_callback' && bodyJson.event) {
+      const event = bodyJson.event as AppMentionEvent;
+
+      if (event.type === 'app_mention') {
+        await handleAppMention(event, env);
+      }
+    }
+
+    return new Response('OK');
+  } catch (error) {
+    console.error('Error in /slack/events:', error);
+    return new Response('Internal Server Error', { status: 500 });
+  }
 });
 
 // GET /health - Health check
@@ -70,85 +95,94 @@ router.all('*', () => new Response('Not Found', { status: 404 }));
 /**
  * Handle @mention: user mentions bot with files
  *
- * Expected message format:
- * @recruiting-agent
- * <JD PDF or text>
- * <Resume PDFs>
- *
- * Bot downloads files, parses, scores, posts results
+ * Expected flow:
+ * 1. User @mentions bot + attaches JD (first file) + resumes (remaining files)
+ * 2. Worker downloads all files
+ * 3. Extracts text from each
+ * 4. Uses JD to determine role + find rubric
+ * 5. Scores each resume against rubric
+ * 6. Posts Tier 1 candidates to thread
  */
-async function handleAppMention(event: SlackEventPayload, env: Env): Promise<void> {
-  const { channel, thread_ts, ts, files, text } = event as AppMentionEvent;
+async function handleAppMention(event: AppMentionEvent, env: Env): Promise<void> {
+  const { channel, thread_ts, ts, files, text } = event;
 
   try {
-    // Step 1: Extract files from message
-    if (!files || files.length === 0) {
-      // Post help message
-      // TODO: Post "Please upload JD and resumes" message
+    // Step 1: Check if files were attached
+    if (!files || files.length < 2) {
+      await postSlackMessage(
+        env.SLACK_BOT_TOKEN,
+        channel,
+        ':warning: Please attach at least 2 files: JD (first) + resumes (remaining).',
+        thread_ts || ts
+      );
       return;
     }
 
-    // Step 2: Download files
-    const downloadedFiles = await Promise.all(
-      files.map((file) => downloadSlackFile(file.url_private, env.SLACK_BOT_TOKEN))
+    // Step 2: Download all files
+    await postSlackMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      ':hourglass_flowing_sand: Downloading files...',
+      thread_ts || ts
     );
 
-    // Step 3: Parse files
-    // - First file is JD (PDF or text)
-    // - Remaining files are resumes (PDFs)
+    const downloadedFiles = await Promise.all(
+      files.map(async (file) => {
+        const content = await downloadSlackFile(file.url_private, env.SLACK_BOT_TOKEN);
+        return { name: file.name, content };
+      })
+    );
+
+    // Step 3: Extract text from each file
+    await postSlackMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      ':page_facing_up: Extracting text from files...',
+      thread_ts || ts
+    );
+
     const [jdFile, ...resumeFiles] = downloadedFiles;
 
-    // TODO: Extract text from JD (parse PDF if needed)
-    // TODO: Extract text from resumes (parse PDFs)
+    const jdText = await extractTextFromFile(jdFile.content, jdFile.name);
+    const resumeTexts = await Promise.all(
+      resumeFiles.map(async (file) => ({
+        name: file.name.replace(/\.[^.]+$/, ''), // Remove extension
+        text: await extractTextFromFile(file.content, file.name),
+      }))
+    );
 
-    // Step 4: Load JD, extract role slug, find rubric
-    // TODO: Integrate with claude.md scoring logic
+    // Step 4: Determine role from JD and load rubric
+    // For now, assume PMM role (can extend to detect role from JD text)
+    const rubric = parsePMMRubric();
 
     // Step 5: Score candidates
-    // TODO: Score all candidates against rubric
+    await postSlackMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      `:bar_chart: Scoring ${resumeTexts.length} candidates against ${rubric.role} rubric...`,
+      thread_ts || ts
+    );
 
-    // Step 6: Post results to thread
-    // TODO: Format Tier 1 candidates, post to Slack
+    const scoredCandidates = resumeTexts.map((resume) => scoreCandidate(resume.name, resume.text, rubric));
+
+    // Step 6: Post results
+    await postSlackMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      `:tada: *Evaluation Complete*\n${scoredCandidates.length} candidates scored.`,
+      thread_ts || ts
+    );
+
+    await formatAndPostResults(scoredCandidates, env.SLACK_BOT_TOKEN, channel, thread_ts || ts);
   } catch (error) {
     console.error('Error processing @mention:', error);
-    // Post error message to thread
-    // TODO: Post "Error processing files" to Slack
+    await postSlackMessage(
+      env.SLACK_BOT_TOKEN,
+      channel,
+      `:x: Error processing files: ${error instanceof Error ? error.message : String(error)}`,
+      thread_ts || ts
+    );
   }
-}
-
-// Slack event types
-interface SlackEvent {
-  type: 'url_verification' | 'event_callback';
-  challenge?: string;
-  event?: SlackEventPayload;
-}
-
-interface SlackEventPayload {
-  type: string;
-  user?: string;
-  channel?: string;
-  text?: string;
-  ts?: string;
-  thread_ts?: string;
-  files?: SlackFile[];
-}
-
-interface AppMentionEvent extends SlackEventPayload {
-  type: 'app_mention';
-  channel: string;
-  text: string;
-  ts: string;
-  thread_ts?: string;
-  files?: SlackFile[];
-}
-
-interface SlackFile {
-  id: string;
-  name: string;
-  title: string;
-  mimetype: string;
-  url_private: string;
-  url_private_download: string;
 }
 
 export default {
