@@ -1,0 +1,19 @@
+# Sensitive config
+config/.slack_config.json
+config/*.env
+
+# Local files
+.DS_Store
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# Temp files
+/tmp/
+*.tmp
+
+# Node
+node_modules/
+.wrangler/
+dist/
